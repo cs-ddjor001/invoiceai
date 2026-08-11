@@ -1,0 +1,5 @@
+*.sqlite*
+
+# Real ADS data — copied in from the source capstone repo, never committed.
+# A small committed subset for CI lives in tests/fixtures/.
+/data/*.csv
