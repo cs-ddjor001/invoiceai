@@ -159,6 +159,11 @@ items (−30), and per-line-item gaps. Final match confidence = match score × (
 | `po_number` column type | **`string(20)`** — unique on `purchase_orders`, nullable + indexed on `invoices` | The original used `db.Integer`. But the invoice-side PO number arrives as free text from an LLM and normalization strips non-digits, so string keeps extraction and storage in the same shape and survives leading zeros or a future non-numeric format. The 7-digit rule is a *validation* concern and lives in the Phase 3 DTO, not the schema. |
 | Extraction HTTP client | **Laravel's built-in `Http::`**, not `openai-php/laravel` | llama-server exposes the OpenAI chat-completions API — one POST with a JSON body. The facade covers it in ~10 lines, and `Http::fake()` lets the whole pipeline be tested with llama-server switched off. One fewer dependency for no lost capability. |
 | Multi-invoice PDFs | **Deferred** — `InvoiceExtractor::extract()` returns one `InvoiceData` | Measured: all sample PDFs hold a single invoice except ~2. `rockybrands_535357-001…pdf` is 5 pages, each a distinct invoice with its own PO and invoice number — but **only the first page's PO appears in the ADS CSVs**, so the others cannot be cross-referenced anyway. If the interface later returns a collection, taking the first element is the correct behaviour for this data. |
+| Model reasoning (`enable_thinking`) | **Off by default** (`EXTRACTION_ENABLE_THINKING=false`). Config-driven, so it can be flipped per environment. | Measured over all 39 sample invoices, twice. **Off:** 37/39 extracted, **29 POs verified against seeded records**, ~8s each, ~5 min total. **On (max_tokens 16384):** 26/39 extracted, 24 verified, ~260s each, **2h49m total** — 11 invoices burned the entire token budget on `reasoning_content` and returned an empty `content`. Raising the budget did not help; the model simply reasons longer to fill it. Note the tradeoff is precision vs recall, not quality: of the 24 POs reasoning returned, **all 24 were correct** (vs 29/33 with it off), and it uniquely rescued `SI266A00090` and `rockybrands`. A **hybrid** is therefore the known upgrade path — run cheap, retry with reasoning only when the first pass yields no valid 7-digit PO (~6 invoices here). Deferred: Phase 5's queue makes slow extraction a worker-time cost rather than a user-facing one, which is where this belongs. |
+| Extraction accuracy target | **None.** 29/39 is accepted as sufficient. | The project's goal is to learn Laravel, not to build a state-of-the-art extractor. The data only has to be good enough to drive Phase 4 matching and the Phase 7 review screens — and a human reviews every invoice anyway. Do not spend time tuning prompts or models beyond what the pipeline needs to function. |
+| PO number normalization | **Not needed — do not build.** | The plan originally called for porting ~40 PO-number alias mappings from `db_writer.py`. Measured: across all 39 invoices, **zero** extracted PO numbers would be rescued by stripping non-digits or alias-mapping. The model returns clean 7-digit values or nothing. A negative result, recorded so it is not rebuilt on speculation. |
+| Reasoning-tag stripping | **Not needed — do not port.** | The source app stripped `<think>...</think>` blocks out of the response text. That was correct for Qwen3, which emits reasoning inline in `content`. The rebuild's model returns reasoning in a **separate `reasoning_content` field**, so `content` is either clean JSON or empty. The `/no_think` marker the source appended to every user prompt is likewise inert here. Ported code would have been dead code. |
+| Vendor identity | **Never extracted from the invoice.** `InvoiceData` carries no vendor field and `SYSTEM_PROMPT` does not ask for one. `invoices.vendor_id` / `invoices.vendor_name` stay in the schema, filled elsewhere. | Measured on the real dataset: only 3–4 of the 39 sample invoices carry any vendor label at all, and where one exists it is a vendor *ID number* for an AP clerk to cross-reference in the CSVs — not a name. Asking the model for a field the documents do not contain produces confident garbage (one run returned `Ward PRO# 0280828432`, a freight tracking number). The source project reached the same conclusion and moved to back-filling. Vendor is resolved two other ways instead: **back-filled from the matched PO** (Phase 4), and **resolved from the sender** on email intake (Phase 6), which was the original team's stretch goal — an AP clerk can identify a vendor from the email that delivered the invoice. |
 | Sample data location | **Copy the two CSVs into `database/data/`, gitignored**; commit a ~20-row subset to `tests/fixtures/` | Gives the seeder a stable relative path instead of depending on a sibling repo's absolute path, and lets Phase 8 CI seed from the committed fixture without putting real ADS vendor and pricing data into git history. The 40 sample PDFs stay in the source repo until Phase 5 needs them. |
 
 ---
@@ -273,13 +278,21 @@ all rows sharing a `PO_NUMBER`, so the seeder needs the equivalent of the Python
       `LazyCollection` + `chunk` + `upsert`, and `SchemaRelationshipsTest` (8 tests) proving
       the graph hangs together. *Milestone met: `migrate:fresh --seed` yields 39 vendors /
       39 purchase orders / 238 PO lines, and re-running converges instead of duplicating.*
-- [ ] **Phase 2 — Auth, roles, layout.** Role enum (`ap`, `admin`, `trainer`), middleware,
+- [x] **Phase 2 — Auth, roles, layout.** Role enum (`ap`, `admin`, `trainer`), middleware,
       policies. Disable self-registration via `config/fortify.php`. Shared Blade layout.
       Three protected role landing pages.
-- [ ] **Phase 3 — Extraction pipeline.** `InvoiceExtractor` interface, `PdfTextExtractor`,
-      `LlmInvoiceExtractor`. `InvoiceData` DTO + `InvoiceNormalizer` (the ~40 PO aliases) +
-      validation rules ported from `validator.py`. `QualityScorer` — wired in this time.
-      Unit tests with `Http::fake()` from day one.
+- [x] **Phase 3 — Extraction pipeline.** `PdfTextExtractor` → `LlmInvoiceExtractor` →
+      `JsonResponseParser` → `InvoiceData` / `InvoiceLineData`, chained by
+      `InvoiceExtractionPipeline`. Config-driven via `config/extraction.php`. 15 tests,
+      `Http::fake()` throughout. *Milestone met: benchmarked over all 39 sample invoices —
+      37 extracted, **29 PO numbers verified against seeded purchase orders**, 36/37 with
+      line-item part numbers, ~8s per invoice.*
+      **Deliberately not built** (see the decisions table for the measurements behind each):
+      `InvoiceExtractor` interface (one implementation is not a choice — add it with the
+      vision driver), `InvoiceNormalizer` (measured unnecessary), `<think>` stripping (wrong
+      model family), vendor extraction (absent from the source documents).
+      **Still open:** `QualityScorer`, and the reasoning-retry hybrid for the ~6 invoices the
+      fast path misses.
 - [ ] **Phase 4 — Matching engine.** `FuzzyScorer`, `ExactMatcher`, `FuzzyMatcher`,
       `AiMatcher`, `MatchingService`. Fix the ÷100 bug. SQL-side candidate prefiltering.
       Heavy PHPUnit coverage — this phase is nearly pure PHP.

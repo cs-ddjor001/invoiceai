@@ -2,62 +2,48 @@
 
 namespace App\Services\Extraction;
 
+use Carbon\CarbonImmutable;
+use Throwable;
+
 class InvoiceData
 {
     /**
-     * Invoice data extracted from a PDF.
-     *
      * @param  array<InvoiceLineData>  $lines
      */
     public function __construct(
-        public readonly ?string $invoiceNumber = null,
-        public readonly ?string $poNumber = null,
-        public readonly ?string $vendorName = null,
-        public readonly ?string $date = null,
-        public readonly ?float $subtotal = null,
-        public readonly ?float $tax = null,
-        public readonly ?float $total = null,
-        public readonly array $lines = [],
-    ) {
-        //
-    }
+        public ?string $invoiceNumber = null,
+        public ?string $poNumber = null,
+        public ?string $date = null,
+        public ?float $subtotal = null,
+        public ?float $tax = null,
+        public ?float $total = null,
+        public array $lines = [],
+    ) {}
 
     /**
-     * @param  array<string, mixed>  $data  the model's decoded JSON
+     * @param  array<string, mixed>  $data
      */
     public static function fromArray(array $data): self
     {
+        $lines = [];
+
+        foreach ($data['line_items'] ?? [] as $row) {
+            if (! is_array($row)) {
+                continue;
+            }
+
+            $lines[] = InvoiceLineData::fromArray($row);
+        }
+
         return new self(
-            // Keys are snake_case because that is what the model sends back. The properties
-            // are camelCase because that is PHP convention. Translating between the two is
-            // the reason this class exists.
             invoiceNumber: self::stringOrNull($data['invoice_number'] ?? null),
             poNumber: self::stringOrNull($data['po_number'] ?? null),
-            vendorName: self::stringOrNull($data['vendor_name'] ?? null),
-            date: self::stringOrNull($data['date'] ?? null),
+            date: self::dateOrNull($data['date'] ?? null),
             subtotal: self::floatOrNull($data['subtotal'] ?? null),
             tax: self::floatOrNull($data['tax'] ?? null),
             total: self::floatOrNull($data['total'] ?? null),
-            lines: array_filter(
-                array_map(
-                    fn ($line) => InvoiceLineData::fromArray($line),
-                    $data['line_items'] ?? []
-                ),
-                fn ($line) => ! $line->isEmpty()
-            ),
+            lines: $lines,
         );
-    }
-
-    public function isEmpty(): bool
-    {
-        return $this->invoiceNumber === null
-        && $this->poNumber === null
-        && $this->vendorName === null
-        && $this->date === null
-        && $this->subtotal === null
-        && $this->tax === null
-        && $this->total === null
-        && empty($this->lines);
     }
 
     private static function stringOrNull(mixed $value): ?string
@@ -66,9 +52,9 @@ class InvoiceData
             return null;
         }
 
-        $trimmed = trim((string) $value);
+        $value = trim((string) $value);
 
-        return $trimmed === '' ? null : $trimmed;
+        return $value === '' ? null : $value;
     }
 
     private static function floatOrNull(mixed $value): ?float
@@ -76,11 +62,26 @@ class InvoiceData
         if (is_int($value) || is_float($value)) {
             return (float) $value;
         }
-
         if (! is_string($value)) {
             return null;
         }
 
-        return is_numeric($trimmed = trim($value)) ? (float) $trimmed : null;
+        $value = str_replace(['$', ',', ' '], '', $value);
+
+        return is_numeric($value) ? (float) $value : null;
+    }
+
+    private static function dateOrNull(mixed $value): ?string
+    {
+        $string = self::stringOrNull($value);
+        if ($string === null) {
+            return null;
+        }
+
+        try {
+            return CarbonImmutable::parse($string)->format('Y-m-d');
+        } catch (Throwable $e) {
+            return null;
+        }
     }
 }
