@@ -128,6 +128,21 @@ items (−30), and per-line-item gaps. Final match confidence = match score × (
   fuzzy. **The Phase 3 `InvoiceData` DTO must carry `part_number` end to end**, or Phase 4's
   deterministic path is decorative.
 
+- **The fuzzy matcher scores PO numbers by string similarity, which is wrong for identifiers.**
+  `fuzzy_matcher.match_by_fields_fuzzy` does `fuzzy_score(invoice.po_number, po.po_number)` at
+  50% weight. Measured: `1413097` vs `1413098` — two unrelated POs — scores **86% similar**,
+  contributing **0.43** toward the 0.55 acceptance threshold on its own. A one-digit difference
+  is a *different* PO, not a *similar* one. And the rescue it theoretically offers never fires:
+  across 39 invoices, extraction either returns the exact PO number or something wholesale wrong
+  (a UPS tracking number, the invoice number) — never an off-by-one digit. Fix: **exact match
+  after normalization, scored 1 or 0.**
+
+- **The date component is dead as written.** `score_date = 1 if invoice.date_issued ==
+  po.date_issued else 0`, at 5% weight. Measured across 29 invoices matched to their real POs:
+  **exactly equal in 3.** Median gap **90 days**, max 275 — because a PO is raised first and
+  invoiced weeks or months later, which is the normal case, not an anomaly. Fix: score by
+  proximity (decay over ~180 days) rather than equality.
+
 - **Part-number comparison is inconsistent between the two matchers.**
   `fuzzy_matcher.has_valid_line_item_match` compares via `normalize()` (uppercase, strips
   `\s-_:;,.`) while `exact_matcher.invoice_has_matching_line_item` uses a bare `.strip()` —
@@ -159,6 +174,7 @@ items (−30), and per-line-item gaps. Final match confidence = match score × (
 | `po_number` column type | **`string(20)`** — unique on `purchase_orders`, nullable + indexed on `invoices` | The original used `db.Integer`. But the invoice-side PO number arrives as free text from an LLM and normalization strips non-digits, so string keeps extraction and storage in the same shape and survives leading zeros or a future non-numeric format. The 7-digit rule is a *validation* concern and lives in the Phase 3 DTO, not the schema. |
 | Extraction HTTP client | **Laravel's built-in `Http::`**, not `openai-php/laravel` | llama-server exposes the OpenAI chat-completions API — one POST with a JSON body. The facade covers it in ~10 lines, and `Http::fake()` lets the whole pipeline be tested with llama-server switched off. One fewer dependency for no lost capability. |
 | Multi-invoice PDFs | **Deferred** — `InvoiceExtractor::extract()` returns one `InvoiceData` | Measured: all sample PDFs hold a single invoice except ~2. `rockybrands_535357-001…pdf` is 5 pages, each a distinct invoice with its own PO and invoice number — but **only the first page's PO appears in the ADS CSVs**, so the others cannot be cross-referenced anyway. If the interface later returns a collection, taking the first element is the correct behaviour for this data. |
+| Matching strategy | **Option A — exact PO lookup, then score confidence.** The PO-number component is binary (1 if equal after normalization, else 0); line items (45%) and date (5%) determine *how confident* we are in that single candidate, not which candidate to pick. | Follows from the two defects above. With a binary PO component the arithmetic caps a non-matching PO at `0.45 + 0.05 = 0.50`, below the 0.55 threshold — so nothing is accepted without an exact PO-number hit. And since `po_number` is `unique`, an exact hit selects exactly one row. The "scan and rank all POs" loop therefore has no job, and matching becomes a lookup plus a confidence score. **Weights are preserved (50/45/5); only the candidate-selection mechanism changes.** Known limitation: the 4 invoices where no PO was extracted and the 3 whose PO is absent from the CSVs can never match. **Option C** — falling back to scanning candidates on line items alone when the PO number is missing or unknown — is the recorded extension if that ever matters. Not built: there is no ground truth in this dataset to validate it against. |
 | Model reasoning (`enable_thinking`) | **Off by default** (`EXTRACTION_ENABLE_THINKING=false`). Config-driven, so it can be flipped per environment. | Measured over all 39 sample invoices, twice. **Off:** 37/39 extracted, **29 POs verified against seeded records**, ~8s each, ~5 min total. **On (max_tokens 16384):** 26/39 extracted, 24 verified, ~260s each, **2h49m total** — 11 invoices burned the entire token budget on `reasoning_content` and returned an empty `content`. Raising the budget did not help; the model simply reasons longer to fill it. Note the tradeoff is precision vs recall, not quality: of the 24 POs reasoning returned, **all 24 were correct** (vs 29/33 with it off), and it uniquely rescued `SI266A00090` and `rockybrands`. A **hybrid** is therefore the known upgrade path — run cheap, retry with reasoning only when the first pass yields no valid 7-digit PO (~6 invoices here). Deferred: Phase 5's queue makes slow extraction a worker-time cost rather than a user-facing one, which is where this belongs. |
 | Extraction accuracy target | **None.** 29/39 is accepted as sufficient. | The project's goal is to learn Laravel, not to build a state-of-the-art extractor. The data only has to be good enough to drive Phase 4 matching and the Phase 7 review screens — and a human reviews every invoice anyway. Do not spend time tuning prompts or models beyond what the pipeline needs to function. |
 | PO number normalization | **Not needed — do not build.** | The plan originally called for porting ~40 PO-number alias mappings from `db_writer.py`. Measured: across all 39 invoices, **zero** extracted PO numbers would be rescued by stripping non-digits or alias-mapping. The model returns clean 7-digit values or nothing. A negative result, recorded so it is not rebuilt on speculation. |

@@ -78,8 +78,18 @@ class InvoiceData
             return null;
         }
 
+        if (! preg_match('/[-\/\.\s]/', $string)) {
+            return null;
+        }
+
         try {
-            return CarbonImmutable::parse($string)->format('Y-m-d');
+            $parsedDate = CarbonImmutable::parse($string);
+            $year = (int) $parsedDate->format('Y');
+            if ($year < 2000 || $year > 2030) {
+                return null;
+            }
+
+            return $parsedDate->format('Y-m-d');
         } catch (Throwable $e) {
             return null;
         }
