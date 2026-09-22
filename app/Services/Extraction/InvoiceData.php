@@ -2,6 +2,7 @@
 
 namespace App\Services\Extraction;
 
+use App\Models\Invoice;
 use Carbon\CarbonImmutable;
 use Throwable;
 
@@ -42,6 +43,30 @@ class InvoiceData
             subtotal: self::floatOrNull($data['subtotal'] ?? null),
             tax: self::floatOrNull($data['tax'] ?? null),
             total: self::floatOrNull($data['total'] ?? null),
+            lines: $lines,
+        );
+    }
+
+    public static function fromModel(Invoice $invoice): self
+    {
+        $lines = [];
+        foreach ($invoice->lines as $line) {
+            $lines[] = new InvoiceLineData(
+                partNumber: $line->part_number,
+                description: $line->description,
+                quantity: self::floatOrNull($line->qty),
+                unitPrice: self::floatOrNull($line->unit_price),
+                amount: self::floatOrNull($line->amount),
+            );
+        }
+
+        return new self(
+            invoiceNumber: self::stringOrNull($invoice->invoice_number),
+            poNumber: self::stringOrNull($invoice->po_number),
+            date: self::dateOrNull($invoice->issued_at?->format('Y-m-d')),
+            subtotal: self::floatOrNull($invoice->subtotal),
+            tax: self::floatOrNull($invoice->tax),
+            total: self::floatOrNull($invoice->amount),
             lines: $lines,
         );
     }

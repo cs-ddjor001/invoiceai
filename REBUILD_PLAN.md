@@ -75,6 +75,11 @@ Deterministic path: exact PO-number match **plus** a line item whose part number
 whose unit price is within tolerance scores 100. Otherwise fall back to weighted fuzzy, with
 a 0.55 acceptance threshold. A match is only recorded when the final score is > 25.
 
+> **Rebuild note:** the weights and tolerance tiers above are preserved exactly. The 100
+> override, the fuzzy fallback and both thresholds are not — measurement showed they were
+> defects or had no effect. See *Matching strategy*, *Match verdict*, *Line-item score* and
+> *Match thresholds* in §3.
+
 Quality score (`app/utils/invoice_quality_score.py`): starts at 100 and subtracts for missing
 raw text, missing `po_number` (−30), missing total (−10), missing date (−8), missing line
 items (−30), and per-line-item gaps. Final match confidence = match score × (quality / 100).
@@ -174,6 +179,9 @@ items (−30), and per-line-item gaps. Final match confidence = match score × (
 | `po_number` column type | **`string(20)`** — unique on `purchase_orders`, nullable + indexed on `invoices` | The original used `db.Integer`. But the invoice-side PO number arrives as free text from an LLM and normalization strips non-digits, so string keeps extraction and storage in the same shape and survives leading zeros or a future non-numeric format. The 7-digit rule is a *validation* concern and lives in the Phase 3 DTO, not the schema. |
 | Extraction HTTP client | **Laravel's built-in `Http::`**, not `openai-php/laravel` | llama-server exposes the OpenAI chat-completions API — one POST with a JSON body. The facade covers it in ~10 lines, and `Http::fake()` lets the whole pipeline be tested with llama-server switched off. One fewer dependency for no lost capability. |
 | Multi-invoice PDFs | **Deferred** — `InvoiceExtractor::extract()` returns one `InvoiceData` | Measured: all sample PDFs hold a single invoice except ~2. `rockybrands_535357-001…pdf` is 5 pages, each a distinct invoice with its own PO and invoice number — but **only the first page's PO appears in the ADS CSVs**, so the others cannot be cross-referenced anyway. If the interface later returns a collection, taking the first element is the correct behaviour for this data. |
+| Match verdict | **A graded score plus a label, never a 100 override.** `confidence` is always `0.50 × PO match + 0.45 × share of confirming lines + 0.05 × date proximity`. `strategy` is `exact` when the PO matches **and** at least one line confirms, otherwise `fuzzy`. Re-matching deletes the invoice's previous `exact`/`fuzzy` row first, so a changed verdict replaces the old one; `ai` rows are left alone. | The source's "exact PO + one confirming line → 100" made sense when it short-circuited a scan of every PO. Under Option A there is no scan, and keeping the override would make any single confirming line score the same as all of them — 1 of 8 identical to 8 of 8 — which hides exactly what a reviewer needs. The label keeps the deterministic/fuzzy distinction without destroying the gradation. |
+| Line-item score | **Share of checkable invoice lines that confirm** (part number via normalized exact-or-prefix of ≥7 chars, **and** price within tolerance). Lines missing a part number or price leave the denominator. **No fuzzy text similarity anywhere.** | The source's 45% term was `max(fuzzy(description), fuzzy(part_number))` and never looked at price — the price-aware function was dead code. Measured over 98 invoice lines on 30 invoices: exact matching confirms at least one line on 9 invoices (30%), exact-or-prefix on 17 (57%); containment and edit distance add only 6 lines between them. Ambiguous prefix hits (12 of 25) are harmless because price must also agree. Dropping text similarity also removes the need for a PHP port of `rapidfuzz`. |
+| Match thresholds | **None.** The 0.25 "record it" and 0.55 "accept it" cut-offs are not ported. | Under Option A a found PO always scores at least 0.50 and an unfound one is never scored, so neither threshold can change an outcome. Whether a verdict is trustworthy is left to the reviewer, guided by `confidence` and `strategy`. |
 | Matching strategy | **Option A — exact PO lookup, then score confidence.** The PO-number component is binary (1 if equal after normalization, else 0); line items (45%) and date (5%) determine *how confident* we are in that single candidate, not which candidate to pick. | Follows from the two defects above. With a binary PO component the arithmetic caps a non-matching PO at `0.45 + 0.05 = 0.50`, below the 0.55 threshold — so nothing is accepted without an exact PO-number hit. And since `po_number` is `unique`, an exact hit selects exactly one row. The "scan and rank all POs" loop therefore has no job, and matching becomes a lookup plus a confidence score. **Weights are preserved (50/45/5); only the candidate-selection mechanism changes.** Known limitation: the 4 invoices where no PO was extracted and the 3 whose PO is absent from the CSVs can never match. **Option C** — falling back to scanning candidates on line items alone when the PO number is missing or unknown — is the recorded extension if that ever matters. Not built: there is no ground truth in this dataset to validate it against. |
 | Model reasoning (`enable_thinking`) | **Off by default** (`EXTRACTION_ENABLE_THINKING=false`). Config-driven, so it can be flipped per environment. | Measured over all 39 sample invoices, twice. **Off:** 37/39 extracted, **29 POs verified against seeded records**, ~8s each, ~5 min total. **On (max_tokens 16384):** 26/39 extracted, 24 verified, ~260s each, **2h49m total** — 11 invoices burned the entire token budget on `reasoning_content` and returned an empty `content`. Raising the budget did not help; the model simply reasons longer to fill it. Note the tradeoff is precision vs recall, not quality: of the 24 POs reasoning returned, **all 24 were correct** (vs 29/33 with it off), and it uniquely rescued `SI266A00090` and `rockybrands`. A **hybrid** is therefore the known upgrade path — run cheap, retry with reasoning only when the first pass yields no valid 7-digit PO (~6 invoices here). Deferred: Phase 5's queue makes slow extraction a worker-time cost rather than a user-facing one, which is where this belongs. |
 | Extraction accuracy target | **None.** 29/39 is accepted as sufficient. | The project's goal is to learn Laravel, not to build a state-of-the-art extractor. The data only has to be good enough to drive Phase 4 matching and the Phase 7 review screens — and a human reviews every invoice anyway. Do not spend time tuning prompts or models beyond what the pipeline needs to function. |
@@ -309,9 +317,18 @@ all rows sharing a `PO_NUMBER`, so the seeder needs the equivalent of the Python
       model family), vendor extraction (absent from the source documents).
       **Still open:** `QualityScorer`, and the reasoning-retry hybrid for the ~6 invoices the
       fast path misses.
-- [ ] **Phase 4 — Matching engine.** `FuzzyScorer`, `ExactMatcher`, `FuzzyMatcher`,
-      `AiMatcher`, `MatchingService`. Fix the ÷100 bug. SQL-side candidate prefiltering.
-      Heavy PHPUnit coverage — this phase is nearly pure PHP.
+- [x] **Phase 4 — Matching engine.** One entry point, `InvoiceMatcher::match(Invoice)`: look
+      up the PO by number, turn the saved invoice into an `InvoiceData` with
+      `InvoiceData::fromModel()`, score it with `MatchScorer`, and replace the invoice's previous
+      deterministic verdict inside a transaction. `MatchScorer` combines `LineMatcher`
+      (`PartNumberMatcher` + `PriceTolerance`) and `DateProximity`. Built test-first from the
+      middle of the phase on. The ÷100 bug cannot recur: there is one 0–1 scale throughout.
+      *Milestone met: 124 tests green, PHPStan clean.*
+      **Deliberately not built** (see the decisions table): fuzzy PO-number matching, fuzzy
+      text similarity on descriptions, the candidate-scan loop, the 0.25 / 0.55 thresholds.
+      **Deferred:** `AiMatcher` (LLM plumbing, not Laravel), Option C's line-only fallback, and
+      stripping the line numbers the model glues onto part numbers (`10 29621-M11001`,
+      ~7 more matching lines).
 - [ ] **Phase 5 — Upload & queues.** Livewire upload (`WithFileUploads` gives drag-drop
       nearly free), `Storage` disk, `ProcessInvoice` job on the queue, `wire:poll` for live
       status, job batching for multi-file, retries and `failed_jobs`.
